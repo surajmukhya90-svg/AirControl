@@ -31,18 +31,78 @@ jobs:
         with:
           gradle-version: '8.7'
 
-      - name: Apply Smooth Hand Tracking & Main-Thread Fixes
+      - name: Apply Gesture Controls, Reels Engine & Auto-Home
         run: |
-          # 1. Fix AndroidManifest xml reference
           sed -i 's/@xml\/accessibility_service_config\.xml/@xml\/accessibility_service_config/g' app/src/main/AndroidManifest.xml
-
-          # 2. Fix Gradle Properties
           echo "android.useAndroidX=true" >> gradle.properties
           echo "android.enableJetifier=true" >> gradle.properties
           echo "android.suppressUnsupportedCompileSdk=35" >> gradle.properties
           echo "org.gradle.jvmargs=-Xmx4096m" >> gradle.properties
 
-          # 3. Fix CursorOverlayManager (Main-Thread Safe Cursor)
+          # 1. Update Accessibility Service for Real Reels Swipe and Taps
+          cat << 'EOF' > app/src/main/java/com/aircontrol/app/service/AirAccessibilityService.kt
+          package com.aircontrol.app.service
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.graphics.Path
+          import android.view.accessibility.AccessibilityEvent
+
+          class AirAccessibilityService : AccessibilityService() {
+
+              companion object {
+                  var instance: AirAccessibilityService? = null
+                      private set
+
+                  val isRunning: Boolean
+                      get() = instance != null
+              }
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  instance = this
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+              override fun onInterrupt() { instance = null }
+              override fun onDestroy() {
+                  super.onDestroy()
+                  instance = null
+              }
+
+              fun performTap(x: Float, y: Float) {
+                  val clickPath = Path().apply { moveTo(x, y) }
+                  val gesture = GestureDescription.Builder()
+                      .addStroke(GestureDescription.StrokeDescription(clickPath, 0, 50))
+                      .build()
+                  dispatchGesture(gesture, null, null)
+              }
+
+              fun performReelNext(width: Float, height: Float) {
+                  val path = Path().apply {
+                      moveTo(width / 2f, height * 0.78f)
+                      lineTo(width / 2f, height * 0.22f)
+                  }
+                  val gesture = GestureDescription.Builder()
+                      .addStroke(GestureDescription.StrokeDescription(path, 0, 220))
+                      .build()
+                  dispatchGesture(gesture, null, null)
+              }
+
+              fun performReelPrev(width: Float, height: Float) {
+                  val path = Path().apply {
+                      moveTo(width / 2f, height * 0.22f)
+                      lineTo(width / 2f, height * 0.78f)
+                  }
+                  val gesture = GestureDescription.Builder()
+                      .addStroke(GestureDescription.StrokeDescription(path, 0, 220))
+                      .build()
+                  dispatchGesture(gesture, null, null)
+              }
+          }
+          EOF
+
+          # 2. Update Overlay Manager (Smooth Auto-Home Docking)
           cat << 'EOF' > app/src/main/java/com/aircontrol/app/service/CursorOverlayManager.kt
           package com.aircontrol.app.service
 
@@ -79,7 +139,7 @@ jobs:
               ).apply {
                   gravity = Gravity.TOP or Gravity.START
                   x = 500
-                  y = 1000
+                  y = 1200
               }
 
               fun show() {
@@ -103,6 +163,20 @@ jobs:
                   }
               }
 
+              fun returnToHome(homeX: Float, homeY: Float) {
+                  mainHandler.post {
+                      if (!isAttached || cursorView == null) return@post
+                      val curX = layoutParams.x.toFloat()
+                      val curY = layoutParams.y.toFloat()
+                      layoutParams.x = (curX + (homeX - curX) * 0.2f).toInt()
+                      layoutParams.y = (curY + (homeY - curY) * 0.2f).toInt()
+                      cursorView?.setState(VisualCursorState.NORMAL)
+                      try {
+                          windowManager.updateViewLayout(cursorView, layoutParams)
+                      } catch (_: Exception) {}
+                  }
+              }
+
               fun updateState(state: VisualCursorState) {
                   mainHandler.post {
                       cursorView?.setState(state)
@@ -112,9 +186,7 @@ jobs:
               fun hide() {
                   mainHandler.post {
                       if (isAttached && cursorView != null) {
-                          try {
-                              windowManager.removeView(cursorView)
-                          } catch (_: Exception) {}
+                          try { windowManager.removeView(cursorView) } catch (_: Exception) {}
                           cursorView = null
                           isAttached = false
                       }
@@ -142,9 +214,8 @@ jobs:
                       when (state) {
                           VisualCursorState.NORMAL -> outerPaint.color = Color.parseColor("#4285F4")
                           VisualCursorState.PINCHED -> outerPaint.color = Color.parseColor("#EA4335")
-                          VisualCursorState.LONG_PRESS -> outerPaint.color = Color.parseColor("#FBBC04")
                           VisualCursorState.SCROLLING -> outerPaint.color = Color.parseColor("#34A853")
-                          else -> outerPaint.color = Color.GRAY
+                          else -> outerPaint.color = Color.parseColor("#FBBC04")
                       }
                       invalidate()
                   }
@@ -153,7 +224,7 @@ jobs:
                       super.onDraw(canvas)
                       val cx = width / 2f
                       val cy = height / 2f
-                      val radius = 24f
+                      val radius = if (currentState == VisualCursorState.PINCHED) 30f else 22f
                       canvas.drawCircle(cx, cy, radius, outerPaint)
                       canvas.drawCircle(cx, cy, radius, ringPaint)
                   }
@@ -161,97 +232,7 @@ jobs:
           }
           EOF
 
-          # 4. Fix HandTrackingAnalyzer (Memory Leak Safe & Low Latency)
-          cat << 'EOF' > app/src/main/java/com/aircontrol/app/tracking/HandTrackingAnalyzer.kt
-          package com.aircontrol.app.tracking
-
-          import android.content.Context
-          import android.graphics.Bitmap
-          import android.graphics.Matrix
-          import android.os.SystemClock
-          import androidx.camera.core.ImageAnalysis
-          import androidx.camera.core.ImageProxy
-          import com.google.mediapipe.framework.image.BitmapImageBuilder
-          import com.google.mediapipe.tasks.core.BaseOptions
-          import com.google.mediapipe.tasks.vision.core.RunningMode
-          import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
-          import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult
-
-          class HandTrackingAnalyzer(
-              context: Context,
-              private val onResult: (HandLandmarkerResult, Long) -> Unit,
-              private val onError: (String) -> Unit
-          ) : ImageAnalysis.Analyzer {
-
-              private var handLandmarker: HandLandmarker? = null
-              private var lastTimestampMs = 0L
-
-              init {
-                  try {
-                      val baseOptions = BaseOptions.builder()
-                          .setModelAssetPath("hand_landmarker.task")
-                          .build()
-
-                      val options = HandLandmarker.HandLandmarkerOptions.builder()
-                          .setBaseOptions(baseOptions)
-                          .setMinHandDetectionConfidence(0.5f)
-                          .setMinTrackingConfidence(0.5f)
-                          .setNumHands(1)
-                          .setRunningMode(RunningMode.LIVE_STREAM)
-                          .setResultListener { result, _ ->
-                              onResult(result, SystemClock.uptimeMillis())
-                          }
-                          .setErrorListener { error ->
-                              onError(error.message ?: "MediaPipe error")
-                          }
-                          .build()
-
-                      handLandmarker = HandLandmarker.createFromOptions(context, options)
-                  } catch (e: Exception) {
-                      onError("Init error: ${e.localizedMessage}")
-                  }
-              }
-
-              override fun analyze(imageProxy: ImageProxy) {
-                  val now = SystemClock.uptimeMillis()
-                  val frameTime = if (now <= lastTimestampMs) lastTimestampMs + 1 else now
-                  lastTimestampMs = frameTime
-
-                  try {
-                      val bitmap = imageProxy.toBitmap()
-                      val rotationDegrees = imageProxy.imageInfo.rotationDegrees
-
-                      val matrix = Matrix().apply {
-                          postRotate(rotationDegrees.toFloat())
-                          postScale(-1f, 1f, (bitmap.width / 2f), (bitmap.height / 2f))
-                      }
-
-                      val rotatedBitmap = Bitmap.createBitmap(
-                          bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true
-                      )
-
-                      val mpImage = BitmapImageBuilder(rotatedBitmap).build()
-                      handLandmarker?.detectAsync(mpImage, frameTime)
-
-                      if (rotatedBitmap != bitmap) {
-                          rotatedBitmap.recycle()
-                      }
-                      bitmap.recycle()
-                  } catch (_: Exception) {} finally {
-                      imageProxy.close()
-                  }
-              }
-
-              fun close() {
-                  try {
-                      handLandmarker?.close()
-                  } catch (_: Exception) {}
-                  handLandmarker = null
-              }
-          }
-          EOF
-
-          # 5. Fix CameraTrackingService (High FPS & Fast Analysis)
+          # 3. Super Smart Tracking Service (Fist, Pinch, Reels Swipe, Auto-Home)
           cat << 'EOF' > app/src/main/java/com/aircontrol/app/service/CameraTrackingService.kt
           package com.aircontrol.app.service
 
@@ -259,7 +240,10 @@ jobs:
           import android.app.PendingIntent
           import android.app.Service
           import android.content.Intent
+          import android.os.Handler
           import android.os.IBinder
+          import android.os.Looper
+          import android.os.SystemClock
           import android.util.Size
           import androidx.camera.core.CameraSelector
           import androidx.camera.core.ImageAnalysis
@@ -270,12 +254,12 @@ jobs:
           import androidx.lifecycle.LifecycleOwner
           import androidx.lifecycle.LifecycleRegistry
           import com.aircontrol.app.AirControlApp
-          import com.aircontrol.app.domain.GestureAction
-          import com.aircontrol.app.domain.GestureStateMachine
           import com.aircontrol.app.domain.OneEuroFilter
+          import com.aircontrol.app.domain.VisualCursorState
           import com.aircontrol.app.tracking.HandTrackingAnalyzer
           import com.aircontrol.app.ui.MainActivity
           import java.util.concurrent.Executors
+          import kotlin.math.hypot
 
           class CameraTrackingService : Service(), LifecycleOwner {
 
@@ -283,10 +267,18 @@ jobs:
               private var overlayManager: CursorOverlayManager? = null
               private var analyzer: HandTrackingAnalyzer? = null
               private val cameraExecutor = Executors.newSingleThreadExecutor()
+              private val mainHandler = Handler(Looper.getMainLooper())
 
-              private val filterX = OneEuroFilter()
-              private val filterY = OneEuroFilter()
-              private val stateMachine = GestureStateMachine()
+              private val filterX = OneEuroFilter(minCutoff = 0.8, beta = 0.005)
+              private val filterY = OneEuroFilter(minCutoff = 0.8, beta = 0.005)
+
+              private var lastHandSeenTime = 0L
+              private var isClickTriggered = false
+              private var lastTapTime = 0L
+              private var lastSwipeTime = 0L
+
+              private var prevIndexY = -1f
+              private var prevSwipeSampleTime = 0L
 
               override val lifecycle: Lifecycle get() = lifecycleRegistry
 
@@ -304,6 +296,25 @@ jobs:
                   overlayManager = CursorOverlayManager(this)
                   overlayManager?.show()
                   isServiceRunning = true
+
+                  startAutoHomeLoop()
+              }
+
+              private fun startAutoHomeLoop() {
+                  val metrics = resources.displayMetrics
+                  val homeX = metrics.widthPixels / 2f
+                  val homeY = metrics.heightPixels * 0.85f
+
+                  mainHandler.post(object : Runnable {
+                      override fun run() {
+                          if (!isServiceRunning) return
+                          val now = SystemClock.uptimeMillis()
+                          if (now - lastHandSeenTime > 750L) {
+                              overlayManager?.returnToHome(homeX, homeY)
+                          }
+                          mainHandler.postDelayed(this, 30L)
+                      }
+                  })
               }
 
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -326,38 +337,64 @@ jobs:
                               context = this,
                               onResult = { result, timestamp ->
                                   val landmarks = result.landmarks()
-                                  if (!landmarks.isNullOrEmpty() && landmarks[0].size > 8) {
+                                  if (!landmarks.isNullOrEmpty() && landmarks[0].size > 20) {
+                                      lastHandSeenTime = timestamp
                                       val hand = landmarks[0]
-                                      val indexX = hand[8].x()
-                                      val indexY = hand[8].y()
-                                      val thumbX = hand[4].x()
-                                      val thumbY = hand[4].y()
-                                      val middleY = hand[12].y()
 
-                                      val rawScreenX = (indexX * screenWidth * 1.4f).coerceIn(0f, screenWidth)
-                                      val rawScreenY = (indexY * screenHeight * 1.4f).coerceIn(0f, screenHeight)
+                                      val wrist = hand[0]
+                                      val thumbTip = hand[4]
+                                      val indexTip = hand[8]
+                                      val middleTip = hand[12]
+                                      val ringTip = hand[16]
+                                      val pinkyTip = hand[20]
+
+                                      // 1. Controlled Smooth Mouse Position (Lower Sensitivity)
+                                      val rawScreenX = (indexTip.x() * screenWidth).coerceIn(0f, screenWidth)
+                                      val rawScreenY = (indexTip.y() * screenHeight).coerceIn(0f, screenHeight)
 
                                       val smoothX = filterX.filter(rawScreenX.toDouble(), timestamp).toFloat()
                                       val smoothY = filterY.filter(rawScreenY.toDouble(), timestamp).toFloat()
 
                                       overlayManager?.updatePosition(smoothX, smoothY)
 
-                                      stateMachine.processFrame(
-                                          thumbTipX = thumbX,
-                                          thumbTipY = thumbY,
-                                          indexTipX = indexX,
-                                          indexTipY = indexY,
-                                          middleTipY = middleY,
-                                          screenX = smoothX,
-                                          screenY = smoothY,
-                                          currentTimeMs = timestamp,
-                                          onAction = { action ->
-                                              handleGestureAction(action)
-                                          },
-                                          onStateChange = { cursorState ->
-                                              overlayManager?.updateState(cursorState)
+                                      // 2. Click Detection: (Easy Pinch OR Fist Mutthi)
+                                      val pinchDist = hypot((thumbTip.x() - indexTip.x()).toDouble(), (thumbTip.y() - indexTip.y()).toDouble()).toFloat()
+                                      val indexToWrist = hypot((indexTip.x() - wrist.x()).toDouble(), (indexTip.y() - wrist.y()).toDouble()).toFloat()
+                                      val middleToWrist = hypot((middleTip.x() - wrist.x()).toDouble(), (middleTip.y() - wrist.y()).toDouble()).toFloat()
+                                      val ringToWrist = hypot((ringTip.x() - wrist.x()).toDouble(), (ringTip.y() - wrist.y()).toDouble()).toFloat()
+
+                                      val isPinch = pinchDist < 0.085f
+                                      val isFist = indexToWrist < 0.28f && middleToWrist < 0.28f && ringToWrist < 0.28f
+
+                                      if (isPinch || isFist) {
+                                          overlayManager?.updateState(VisualCursorState.PINCHED)
+                                          if (!isClickTriggered && (timestamp - lastTapTime > 400L)) {
+                                              isClickTriggered = true
+                                              lastTapTime = timestamp
+                                              AirAccessibilityService.instance?.performTap(smoothX, smoothY)
                                           }
-                                      )
+                                      } else {
+                                          isClickTriggered = false
+                                          overlayManager?.updateState(VisualCursorState.NORMAL)
+                                      }
+
+                                      // 3. Reels Swipe Gestures (Flick Up = Next Reel, Flick Down = Prev Reel)
+                                      if (timestamp - prevSwipeSampleTime > 160L) {
+                                          if (prevIndexY > 0f && (timestamp - lastSwipeTime > 700L)) {
+                                              val deltaY = indexTip.y() - prevIndexY
+                                              if (deltaY < -0.16f) { // Hand flicked UP -> Next Reel
+                                                  lastSwipeTime = timestamp
+                                                  overlayManager?.updateState(VisualCursorState.SCROLLING)
+                                                  AirAccessibilityService.instance?.performReelNext(screenWidth, screenHeight)
+                                              } else if (deltaY > 0.16f) { // Hand flicked DOWN -> Previous Reel
+                                                  lastSwipeTime = timestamp
+                                                  overlayManager?.updateState(VisualCursorState.SCROLLING)
+                                                  AirAccessibilityService.instance?.performReelPrev(screenWidth, screenHeight)
+                                              }
+                                          }
+                                          prevIndexY = indexTip.y()
+                                          prevSwipeSampleTime = timestamp
+                                      }
                                   }
                               },
                               onError = { }
@@ -378,18 +415,6 @@ jobs:
                   }, ContextCompat.getMainExecutor(this))
               }
 
-              private fun handleGestureAction(action: GestureAction) {
-                  val accessibility = AirAccessibilityService.instance ?: return
-                  when (action) {
-                      is GestureAction.Click -> accessibility.performTap(action.x, action.y)
-                      is GestureAction.LongPress -> accessibility.performLongPress(action.x, action.y)
-                      is GestureAction.Scroll -> accessibility.performScroll(action.startX, action.startY, action.deltaY)
-                      is GestureAction.Back -> accessibility.performBack()
-                      is GestureAction.Home -> accessibility.performHome()
-                      is GestureAction.Move, is GestureAction.Drag -> {}
-                  }
-              }
-
               private fun createNotification(): Notification {
                   val pendingIntent = PendingIntent.getActivity(
                       this, 0, Intent(this, MainActivity::class.java),
@@ -397,32 +422,4 @@ jobs:
                   )
                   return NotificationCompat.Builder(this, AirControlApp.CHANNEL_ID)
                       .setContentTitle("AirControl is Active")
-                      .setContentText("Hand tracking & air gestures are live")
-                      .setSmallIcon(android.R.drawable.ic_menu_compass)
-                      .setContentIntent(pendingIntent)
-                      .setOngoing(true)
-                      .build()
-              }
-
-              override fun onDestroy() {
-                  super.onDestroy()
-                  isServiceRunning = false
-                  lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
-                  analyzer?.close()
-                  cameraExecutor.shutdown()
-                  overlayManager?.hide()
-                  stateMachine.reset()
-              }
-
-              override fun onBind(intent: Intent?): IBinder? = null
-          }
-          EOF
-
-      - name: Compile and Build APK
-        run: gradle assembleDebug --no-daemon
-
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: AirControl-App
-          path: "**/build/outputs/apk/debug/*.apk"
+                      .setContentText("Pinch/Fist to tap, Flick up/d
