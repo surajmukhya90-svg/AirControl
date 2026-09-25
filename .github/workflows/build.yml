@@ -31,14 +31,15 @@ jobs:
         with:
           gradle-version: '8.7'
 
-      - name: Generate Android Properties
+      - name: Fix Resources and Properties
         run: |
+          sed -i 's/@xml\/accessibility_service_config\.xml/@xml\/accessibility_service_config/g' app/src/main/AndroidManifest.xml
           echo "android.useAndroidX=true" >> gradle.properties
           echo "android.enableJetifier=true" >> gradle.properties
           echo "android.suppressUnsupportedCompileSdk=35" >> gradle.properties
 
       - name: Compile and Build APK
-        run: gradle assembleDebug --stacktrace --no-daemon
+        run: gradle assembleDebug --no-daemon
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
