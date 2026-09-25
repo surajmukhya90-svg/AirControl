@@ -16,8 +16,8 @@ jobs:
         run: |
           unzip -o AirControl*.zip
           if [ -d "AirControl" ]; then
-            shopt -s dotglob
-            mv AirControl/* .
+            rm -rf AirControl/.github
+            cp -rf AirControl/* .
           fi
 
       - name: Setup Java 17
