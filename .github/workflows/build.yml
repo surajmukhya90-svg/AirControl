@@ -37,6 +37,7 @@ jobs:
           echo "android.useAndroidX=true" >> gradle.properties
           echo "android.enableJetifier=true" >> gradle.properties
           echo "android.suppressUnsupportedCompileSdk=35" >> gradle.properties
+          echo "org.gradle.jvmargs=-Xmx4096m" >> gradle.properties
 
       - name: Compile and Build APK
         run: gradle assembleDebug --no-daemon
