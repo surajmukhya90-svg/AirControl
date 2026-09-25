@@ -31,6 +31,12 @@ jobs:
         with:
           gradle-version: '8.7'
 
+      - name: Generate Android Properties
+        run: |
+          echo "android.useAndroidX=true" >> gradle.properties
+          echo "android.enableJetifier=true" >> gradle.properties
+          echo "android.suppressUnsupportedCompileSdk=35" >> gradle.properties
+
       - name: Compile and Build APK
         run: gradle assembleDebug --stacktrace --no-daemon
 
