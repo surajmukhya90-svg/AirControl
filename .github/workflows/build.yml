@@ -285,5 +285,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: AirControl-App
-          path: "**/build/outputs/apk/debug/*.apk"_IMMUTABLE
+          path: "**/build/outputs/apk/debug/*.apk"
                 
