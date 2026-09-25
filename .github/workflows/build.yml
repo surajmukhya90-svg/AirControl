@@ -12,7 +12,7 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Unzip Project Files
+      - name: Unzip Fresh Project Files
         run: |
           unzip -o AirControl*.zip
           if [ -d "AirControl" ]; then
