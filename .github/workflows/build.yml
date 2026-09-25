@@ -31,13 +31,113 @@ jobs:
         with:
           gradle-version: '8.7'
 
-      - name: Fix Resources and Properties
+      - name: Apply Crash-Proof Code Fixes
         run: |
+          # 1. Fix AndroidManifest xml reference
           sed -i 's/@xml\/accessibility_service_config\.xml/@xml\/accessibility_service_config/g' app/src/main/AndroidManifest.xml
+
+          # 2. Fix Gradle Properties & 4GB RAM
           echo "android.useAndroidX=true" >> gradle.properties
           echo "android.enableJetifier=true" >> gradle.properties
           echo "android.suppressUnsupportedCompileSdk=35" >> gradle.properties
           echo "org.gradle.jvmargs=-Xmx4096m" >> gradle.properties
+
+          # 3. Crash-proof MainActivity (Safe Launch)
+          cat << 'EOF' > app/src/main/java/com/aircontrol/app/ui/MainActivity.kt
+          package com.aircontrol.app.ui
+
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.runtime.*
+          import androidx.lifecycle.ViewModelProvider
+          import com.aircontrol.app.ui.screens.DashboardScreen
+          import com.aircontrol.app.ui.screens.PrivacyScreen
+
+          class MainActivity : ComponentActivity() {
+
+              private lateinit var viewModel: MainViewModel
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  try {
+                      viewModel = ViewModelProvider(
+                          this,
+                          ViewModelProvider.AndroidViewModelFactory.getInstance(application)
+                      )[MainViewModel::class.java]
+                  } catch (e: Exception) {
+                      viewModel = MainViewModel(application)
+                  }
+
+                  setContent {
+                      MaterialTheme {
+                          val state by viewModel.uiState.collectAsState()
+                          var showPrivacy by remember { mutableStateOf(false) }
+
+                          if (showPrivacy) {
+                              PrivacyScreen(onBack = { showPrivacy = false })
+                          } else {
+                              DashboardScreen(
+                                  state = state,
+                                  onToggleTracking = { viewModel.toggleTracking(it) },
+                                  onSensitivityChange = { viewModel.updateSensitivity(it) },
+                                  onSmoothingChange = { viewModel.updateSmoothing(it) },
+                                  onOpenPrivacy = { showPrivacy = true }
+                              )
+                          }
+                      }
+                  }
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  if (::viewModel.isInitialized) {
+                      viewModel.refreshStatus()
+                  }
+              }
+          }
+          EOF
+
+          # 4. Crash-proof Application Class
+          cat << 'EOF' > app/src/main/java/com/aircontrol/app/AirControlApp.kt
+          package com.aircontrol.app
+
+          import android.app.Application
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.os.Build
+
+          class AirControlApp : Application() {
+              companion object {
+                  const val CHANNEL_ID = "aircontrol_service_channel"
+                  lateinit var instance: AirControlApp
+                      private set
+              }
+
+              override fun onCreate() {
+                  super.onCreate()
+                  instance = this
+                  try {
+                      createNotificationChannel()
+                  } catch (e: Exception) {}
+              }
+
+              private fun createNotificationChannel() {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val channel = NotificationChannel(
+                          CHANNEL_ID,
+                          "AirControl Tracking Service",
+                          NotificationManager.IMPORTANCE_LOW
+                      ).apply {
+                          description = "Notifies when AirControl is actively tracking your hand."
+                      }
+                      val manager = getSystemService(NotificationManager::class.java)
+                      manager?.createNotificationChannel(channel)
+                  }
+              }
+          }
+          EOF
 
       - name: Compile and Build APK
         run: gradle assembleDebug --no-daemon
