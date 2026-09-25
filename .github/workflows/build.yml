@@ -39,18 +39,6 @@ jobs:
           echo "android.suppressUnsupportedCompileSdk=35" >> gradle.properties
           echo "org.gradle.jvmargs=-Xmx4096m" >> gradle.properties
 
-      - name: Apply Gestures, Auto-Home and Low Sensitivity
-        run: |
-          # 1. Sensitivity ko slow aur smooth karein
-          sed -i 's/\* 1.5f/\* 0.85f/g' app/src/main/java/com/aircontrol/app/service/CameraTrackingService.kt
-          sed -i 's/\* 1.4f/\* 0.85f/g' app/src/main/java/com/aircontrol/app/service/CameraTrackingService.kt
-
-          # 2. Click ko super easy karein (halka touch karte hi tap)
-          sed -i 's/0.045f/0.095f/g' app/src/main/java/com/aircontrol/app/domain/GestureStateMachine.kt
-
-          # 3. Auto-Home: Haath na dikhne par screen ke bottom center par dock karein
-          sed -i 's/if (!landmarks.isNullOrEmpty() && landmarks\[0\].size > 8) {/if (landmarks.isNullOrEmpty()) { overlayManager?.updatePosition(screenWidth \/ 2f, screenHeight * 0.85f) } else if (landmarks[0].size > 8) {/g' app/src/main/java/com/aircontrol/app/service/CameraTrackingService.kt
-
       - name: Compile and Build APK
         run: gradle assembleDebug --no-daemon
 
