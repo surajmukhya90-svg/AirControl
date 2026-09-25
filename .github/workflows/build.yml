@@ -31,18 +31,227 @@ jobs:
         with:
           gradle-version: '8.7'
 
-      - name: Apply Camera Tracking and Lifecycle Fixes
+      - name: Apply Smooth Hand Tracking & Main-Thread Fixes
         run: |
-          # 1. Fix AndroidManifest
+          # 1. Fix AndroidManifest xml reference
           sed -i 's/@xml\/accessibility_service_config\.xml/@xml\/accessibility_service_config/g' app/src/main/AndroidManifest.xml
 
-          # 2. Fix Properties
+          # 2. Fix Gradle Properties
           echo "android.useAndroidX=true" >> gradle.properties
           echo "android.enableJetifier=true" >> gradle.properties
           echo "android.suppressUnsupportedCompileSdk=35" >> gradle.properties
           echo "org.gradle.jvmargs=-Xmx4096m" >> gradle.properties
 
-          # 3. Fix CameraTrackingService (RESUMED Lifecycle for CameraX)
+          # 3. Fix CursorOverlayManager (Main-Thread Safe Cursor)
+          cat << 'EOF' > app/src/main/java/com/aircontrol/app/service/CursorOverlayManager.kt
+          package com.aircontrol.app.service
+
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.PixelFormat
+          import android.os.Build
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.Gravity
+          import android.view.View
+          import android.view.WindowManager
+          import com.aircontrol.app.domain.VisualCursorState
+
+          class CursorOverlayManager(private val context: Context) {
+              private val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+              private val mainHandler = Handler(Looper.getMainLooper())
+              private var cursorView: CursorView? = null
+              private var isAttached = false
+
+              private val layoutParams = WindowManager.LayoutParams(
+                  WindowManager.LayoutParams.WRAP_CONTENT,
+                  WindowManager.LayoutParams.WRAP_CONTENT,
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                  else
+                      WindowManager.LayoutParams.TYPE_PHONE,
+                  WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                  PixelFormat.TRANSLUCENT
+              ).apply {
+                  gravity = Gravity.TOP or Gravity.START
+                  x = 500
+                  y = 1000
+              }
+
+              fun show() {
+                  mainHandler.post {
+                      if (!isAttached) {
+                          cursorView = CursorView(context)
+                          windowManager.addView(cursorView, layoutParams)
+                          isAttached = true
+                      }
+                  }
+              }
+
+              fun updatePosition(x: Float, y: Float) {
+                  mainHandler.post {
+                      if (!isAttached || cursorView == null) return@post
+                      layoutParams.x = x.toInt()
+                      layoutParams.y = y.toInt()
+                      try {
+                          windowManager.updateViewLayout(cursorView, layoutParams)
+                      } catch (_: Exception) {}
+                  }
+              }
+
+              fun updateState(state: VisualCursorState) {
+                  mainHandler.post {
+                      cursorView?.setState(state)
+                  }
+              }
+
+              fun hide() {
+                  mainHandler.post {
+                      if (isAttached && cursorView != null) {
+                          try {
+                              windowManager.removeView(cursorView)
+                          } catch (_: Exception) {}
+                          cursorView = null
+                          isAttached = false
+                      }
+                  }
+              }
+
+              private class CursorView(context: Context) : View(context) {
+                  private var currentState = VisualCursorState.NORMAL
+                  private val outerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                      style = Paint.Style.FILL
+                      color = Color.parseColor("#4285F4")
+                  }
+                  private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                      style = Paint.Style.STROKE
+                      strokeWidth = 6f
+                      color = Color.WHITE
+                  }
+
+                  override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+                      setMeasuredDimension(90, 90)
+                  }
+
+                  fun setState(state: VisualCursorState) {
+                      this.currentState = state
+                      when (state) {
+                          VisualCursorState.NORMAL -> outerPaint.color = Color.parseColor("#4285F4")
+                          VisualCursorState.PINCHED -> outerPaint.color = Color.parseColor("#EA4335")
+                          VisualCursorState.LONG_PRESS -> outerPaint.color = Color.parseColor("#FBBC04")
+                          VisualCursorState.SCROLLING -> outerPaint.color = Color.parseColor("#34A853")
+                          else -> outerPaint.color = Color.GRAY
+                      }
+                      invalidate()
+                  }
+
+                  override fun onDraw(canvas: Canvas) {
+                      super.onDraw(canvas)
+                      val cx = width / 2f
+                      val cy = height / 2f
+                      val radius = 24f
+                      canvas.drawCircle(cx, cy, radius, outerPaint)
+                      canvas.drawCircle(cx, cy, radius, ringPaint)
+                  }
+              }
+          }
+          EOF
+
+          # 4. Fix HandTrackingAnalyzer (Memory Leak Safe & Low Latency)
+          cat << 'EOF' > app/src/main/java/com/aircontrol/app/tracking/HandTrackingAnalyzer.kt
+          package com.aircontrol.app.tracking
+
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.Matrix
+          import android.os.SystemClock
+          import androidx.camera.core.ImageAnalysis
+          import androidx.camera.core.ImageProxy
+          import com.google.mediapipe.framework.image.BitmapImageBuilder
+          import com.google.mediapipe.tasks.core.BaseOptions
+          import com.google.mediapipe.tasks.vision.core.RunningMode
+          import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
+          import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult
+
+          class HandTrackingAnalyzer(
+              context: Context,
+              private val onResult: (HandLandmarkerResult, Long) -> Unit,
+              private val onError: (String) -> Unit
+          ) : ImageAnalysis.Analyzer {
+
+              private var handLandmarker: HandLandmarker? = null
+              private var lastTimestampMs = 0L
+
+              init {
+                  try {
+                      val baseOptions = BaseOptions.builder()
+                          .setModelAssetPath("hand_landmarker.task")
+                          .build()
+
+                      val options = HandLandmarker.HandLandmarkerOptions.builder()
+                          .setBaseOptions(baseOptions)
+                          .setMinHandDetectionConfidence(0.5f)
+                          .setMinTrackingConfidence(0.5f)
+                          .setNumHands(1)
+                          .setRunningMode(RunningMode.LIVE_STREAM)
+                          .setResultListener { result, _ ->
+                              onResult(result, SystemClock.uptimeMillis())
+                          }
+                          .setErrorListener { error ->
+                              onError(error.message ?: "MediaPipe error")
+                          }
+                          .build()
+
+                      handLandmarker = HandLandmarker.createFromOptions(context, options)
+                  } catch (e: Exception) {
+                      onError("Init error: ${e.localizedMessage}")
+                  }
+              }
+
+              override fun analyze(imageProxy: ImageProxy) {
+                  val now = SystemClock.uptimeMillis()
+                  val frameTime = if (now <= lastTimestampMs) lastTimestampMs + 1 else now
+                  lastTimestampMs = frameTime
+
+                  try {
+                      val bitmap = imageProxy.toBitmap()
+                      val rotationDegrees = imageProxy.imageInfo.rotationDegrees
+
+                      val matrix = Matrix().apply {
+                          postRotate(rotationDegrees.toFloat())
+                          postScale(-1f, 1f, (bitmap.width / 2f), (bitmap.height / 2f))
+                      }
+
+                      val rotatedBitmap = Bitmap.createBitmap(
+                          bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true
+                      )
+
+                      val mpImage = BitmapImageBuilder(rotatedBitmap).build()
+                      handLandmarker?.detectAsync(mpImage, frameTime)
+
+                      if (rotatedBitmap != bitmap) {
+                          rotatedBitmap.recycle()
+                      }
+                      bitmap.recycle()
+                  } catch (_: Exception) {} finally {
+                      imageProxy.close()
+                  }
+              }
+
+              fun close() {
+                  try {
+                      handLandmarker?.close()
+                  } catch (_: Exception) {}
+                  handLandmarker = null
+              }
+          }
+          EOF
+
+          # 5. Fix CameraTrackingService (High FPS & Fast Analysis)
           cat << 'EOF' > app/src/main/java/com/aircontrol/app/service/CameraTrackingService.kt
           package com.aircontrol.app.service
 
@@ -51,6 +260,7 @@ jobs:
           import android.app.Service
           import android.content.Intent
           import android.os.IBinder
+          import android.util.Size
           import androidx.camera.core.CameraSelector
           import androidx.camera.core.ImageAnalysis
           import androidx.camera.lifecycle.ProcessCameraProvider
@@ -124,8 +334,8 @@ jobs:
                                       val thumbY = hand[4].y()
                                       val middleY = hand[12].y()
 
-                                      val rawScreenX = (indexX * screenWidth * 1.5f).coerceIn(0f, screenWidth)
-                                      val rawScreenY = (indexY * screenHeight * 1.5f).coerceIn(0f, screenHeight)
+                                      val rawScreenX = (indexX * screenWidth * 1.4f).coerceIn(0f, screenWidth)
+                                      val rawScreenY = (indexY * screenHeight * 1.4f).coerceIn(0f, screenHeight)
 
                                       val smoothX = filterX.filter(rawScreenX.toDouble(), timestamp).toFloat()
                                       val smoothY = filterY.filter(rawScreenY.toDouble(), timestamp).toFloat()
@@ -154,6 +364,7 @@ jobs:
                           )
 
                           val analysisUseCase = ImageAnalysis.Builder()
+                              .setTargetResolution(Size(480, 640))
                               .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                               .build()
                               .also {
